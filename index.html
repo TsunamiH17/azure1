@@ -1,0 +1,755 @@
+<title>HECTOR</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@900&family=Manrope:wght@500;600&display=swap" rel="stylesheet">
+<style>
+    /* Layout: lienzo WebGL a pantalla completa, una sola pista de ayuda flotando abajo. Pieza deliberadamente oscura. */
+    :root {
+        --bg: #05060a;
+        --fg: #e9ecf5;
+        --muted: rgba(233, 236, 245, 0.62);
+        --chip: rgba(14, 16, 26, 0.55);
+        --chip-line: rgba(233, 236, 245, 0.14);
+        --font-display: 'Unbounded', 'Arial Black', Impact, sans-serif;
+        --font-ui: 'Manrope', system-ui, sans-serif;
+        color-scheme: dark;
+    }
+    html, body { height: 100%; }
+    body {
+        margin: 0;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: var(--font-ui);
+        padding-left: max(16px, env(safe-area-inset-left, 0px));
+        padding-right: max(16px, env(safe-area-inset-right, 0px));
+    }
+    #stage {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        display: block;
+        touch-action: none;
+        cursor: crosshair;
+    }
+    .hint {
+        position: fixed;
+        left: 50%;
+        bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+        transform: translateX(-50%);
+        max-width: calc(100% - 32px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+        padding: 10px 18px;
+        border-radius: 999px;
+        background: var(--chip);
+        border: 1px solid var(--chip-line);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        font-size: 13px;
+        font-weight: 500;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+        text-align: center;
+        pointer-events: none;
+        transition: opacity 1.2s ease 0.6s;
+    }
+    .hint.gone { opacity: 0; }
+    .sr {
+        position: absolute;
+        width: 1px; height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+    }
+    /* Respaldo sin WebGL2 */
+    .fallback .sr {
+        position: fixed;
+        inset: 0;
+        width: auto; height: auto;
+        clip: auto;
+        display: grid;
+        place-items: center;
+        margin: 0;
+        font-family: var(--font-display);
+        font-weight: 900;
+        font-size: clamp(48px, 14vw, 220px);
+        background: linear-gradient(110deg, #00d9ff, #ff4769 40%, #ffa90d 70%, #00d9ff);
+        background-size: 200% 100%;
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        animation: sheen 6s linear infinite;
+    }
+    .fallback #stage { display: none; }
+    @keyframes sheen { to { background-position: -200% 0; } }
+    @media (prefers-reduced-motion: reduce) {
+        .fallback .sr { animation: none; }
+        .hint { transition: none; }
+    }
+</style>
+
+<h1 class="sr">HECTOR</h1>
+<canvas id="stage" aria-hidden="true"></canvas>
+<div class="hint" id="hint">Mueve el cursor para agitar el fluido · Haz clic para recristalizar</div>
+
+<script>
+(() => {
+    'use strict';
+    const TEXT = 'HECTOR';
+    const canvas = document.getElementById('stage');
+    const hint = document.getElementById('hint');
+    const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const coarse = matchMedia('(pointer: coarse)').matches;
+    if (coarse) hint.textContent = 'Arrastra para agitar el fluido · Toca para recristalizar';
+
+    // ── Paleta del fluido: cian eléctrico, coral, ámbar solar, ultravioleta ──
+    const PALETTE = [[0.0, 0.85, 1.0], [1.0, 0.28, 0.42], [1.0, 0.66, 0.05], [0.52, 0.22, 1.0]];
+    function paletteAt(x) {
+        const n = PALETTE.length;
+        x = ((x % n) + n) % n;
+        const i = Math.floor(x), f = x - i, s = f * f * (3 - 2 * f);
+        const a = PALETTE[i], b = PALETTE[(i + 1) % n];
+        return [a[0] + (b[0] - a[0]) * s, a[1] + (b[1] - a[1]) * s, a[2] + (b[2] - a[2]) * s];
+    }
+    function mulberry32(a) {
+        return () => {
+            a |= 0; a = a + 0x6D2B79F5 | 0;
+            let t = Math.imul(a ^ a >>> 15, 1 | a);
+            t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+            return ((t ^ t >>> 14) >>> 0) / 4294967296;
+        };
+    }
+
+    // ── Configuración del fluido ──
+    const CFG = {
+        SIM_RES: 128,
+        DYE_RES: coarse ? 512 : 1024,
+        DENSITY_DISS: 0.42,
+        VEL_DISS: 0.22,
+        PRESSURE: 0.8,
+        ITER: 20,
+        CURL: 24,
+        SPLAT_RADIUS: 0.22,
+        SPLAT_FORCE: 6000
+    };
+
+    let gl;
+    try {
+        gl = canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false, preserveDrawingBuffer: false });
+        if (!gl || !gl.getExtension('EXT_color_buffer_float')) throw new Error('sin WebGL2');
+    } catch (e) {
+        document.body.classList.add('fallback');
+        hint.hidden = true;
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SHADERS
+    // ═══════════════════════════════════════════════════════════════════
+    const VS = `#version 300 es
+    in vec2 aPos;
+    out vec2 vUv; out vec2 vL; out vec2 vR; out vec2 vT; out vec2 vB;
+    uniform vec2 texelSize;
+    void main(){
+        vUv = aPos*0.5+0.5;
+        vL = vUv - vec2(texelSize.x,0.0); vR = vUv + vec2(texelSize.x,0.0);
+        vT = vUv + vec2(0.0,texelSize.y); vB = vUv - vec2(0.0,texelSize.y);
+        gl_Position = vec4(aPos,0.0,1.0);
+    }`;
+    const HEAD = `#version 300 es
+    precision highp float; precision highp sampler2D;
+    in vec2 vUv; in vec2 vL; in vec2 vR; in vec2 vT; in vec2 vB;
+    out vec4 o;
+    `;
+
+    const FS = {
+        splat: `
+        uniform sampler2D uTarget; uniform float aspectRatio; uniform vec3 color; uniform vec2 point; uniform float radius;
+        void main(){
+            vec2 p = vUv - point; p.x *= aspectRatio;
+            vec3 s = exp(-dot(p,p)/radius)*color;
+            o = vec4(texture(uTarget,vUv).xyz + s, 1.0);
+        }`,
+        advect: `
+        uniform sampler2D uVelocity; uniform sampler2D uSource; uniform vec2 uVelTexel; uniform float dt; uniform float dissipation;
+        void main(){
+            vec2 coord = vUv - dt*texture(uVelocity,vUv).xy*uVelTexel;
+            o = texture(uSource,coord)/(1.0+dissipation*dt);
+        }`,
+        divergence: `
+        uniform sampler2D uVelocity;
+        void main(){
+            float L = texture(uVelocity,vL).x, R = texture(uVelocity,vR).x;
+            float T = texture(uVelocity,vT).y, B = texture(uVelocity,vB).y;
+            vec2 C = texture(uVelocity,vUv).xy;
+            if(vL.x<0.0) L=-C.x; if(vR.x>1.0) R=-C.x; if(vT.y>1.0) T=-C.y; if(vB.y<0.0) B=-C.y;
+            o = vec4(0.5*(R-L+T-B),0.0,0.0,1.0);
+        }`,
+        curl: `
+        uniform sampler2D uVelocity;
+        void main(){
+            float L = texture(uVelocity,vL).y, R = texture(uVelocity,vR).y;
+            float T = texture(uVelocity,vT).x, B = texture(uVelocity,vB).x;
+            o = vec4(0.5*(R-L-T+B),0.0,0.0,1.0);
+        }`,
+        vorticity: `
+        uniform sampler2D uVelocity; uniform sampler2D uCurl; uniform float curl; uniform float dt;
+        void main(){
+            float L = texture(uCurl,vL).x, R = texture(uCurl,vR).x, T = texture(uCurl,vT).x, B = texture(uCurl,vB).x;
+            float C = texture(uCurl,vUv).x;
+            vec2 f = 0.5*vec2(abs(T)-abs(B), abs(R)-abs(L));
+            f /= length(f)+0.0001; f *= curl*C; f.y *= -1.0;
+            vec2 v = texture(uVelocity,vUv).xy + f*dt;
+            o = vec4(clamp(v,-1000.0,1000.0),0.0,1.0);
+        }`,
+        pressure: `
+        uniform sampler2D uPressure; uniform sampler2D uDivergence;
+        void main(){
+            float L = texture(uPressure,vL).x, R = texture(uPressure,vR).x, T = texture(uPressure,vT).x, B = texture(uPressure,vB).x;
+            o = vec4((L+R+B+T-texture(uDivergence,vUv).x)*0.25,0.0,0.0,1.0);
+        }`,
+        gradient: `
+        uniform sampler2D uPressure; uniform sampler2D uVelocity;
+        void main(){
+            float L = texture(uPressure,vL).x, R = texture(uPressure,vR).x, T = texture(uPressure,vT).x, B = texture(uPressure,vB).x;
+            vec2 v = texture(uVelocity,vUv).xy - vec2(R-L,T-B);
+            o = vec4(v,0.0,1.0);
+        }`,
+        clear: `
+        uniform sampler2D uTexture; uniform float value;
+        void main(){ o = value*texture(uTexture,vUv); }`,
+        blur: `
+        uniform sampler2D uTex; uniform vec2 uDir;
+        void main(){
+            float s = 0.0, w = 0.0;
+            for(int i=-20;i<=20;i++){
+                float fi = float(i); float g = exp(-fi*fi/128.0);
+                s += texture(uTex, vUv+uDir*fi).r*g; w += g;
+            }
+            o = vec4(s/w,0.0,0.0,1.0);
+        }`,
+        display: `
+        uniform sampler2D uDye; uniform sampler2D uMask; uniform sampler2D uBevel; uniform sampler2D uGlow;
+        uniform vec2 uRes; uniform float uTime; uniform float uReveal; uniform vec2 uLight; uniform vec2 uTilt;
+        uniform float uBevelK; uniform float uCellPx; uniform vec2 uBox;
+
+        vec2 hash2(vec2 p){ p = vec2(dot(p,vec2(127.1,311.7)), dot(p,vec2(269.5,183.3))); return fract(sin(p)*43758.5453); }
+        float hash1(vec2 p){ return fract(sin(dot(p,vec2(12.9898,78.233)))*43758.5453); }
+
+        void voronoi(vec2 x, out float edge, out vec2 cid){
+            vec2 n = floor(x), f = fract(x);
+            vec2 mg = vec2(0.0), mr = vec2(0.0); float md = 8.0;
+            for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++){
+                vec2 g = vec2(float(i),float(j)); vec2 r = g + hash2(n+g) - f;
+                float d = dot(r,r); if(d<md){ md=d; mr=r; mg=g; }
+            }
+            md = 8.0;
+            for(int j=-2;j<=2;j++) for(int i=-2;i<=2;i++){
+                vec2 g = mg + vec2(float(i),float(j)); vec2 r = g + hash2(n+g) - f;
+                if(dot(mr-r,mr-r)>0.00001) md = min(md, dot(0.5*(mr+r), normalize(r-mr)));
+            }
+            edge = md; cid = n+mg;
+        }
+        vec3 tm(vec3 x){ return 1.0-exp(-x*1.6); }
+
+        void main(){
+            vec2 uv = vUv;
+            float aspect = uRes.x/uRes.y;
+            vec2 tuv = uv - uTilt*vec2(0.010,0.014);
+
+            float raw = texture(uMask,tuv).r;
+            float edge = 1.0, cr = 0.0; vec2 fn = vec2(0.0);
+            float tx = clamp((tuv.x-uBox.x)/(uBox.y-uBox.x),0.0,1.0);
+            float vis = 0.0, birth = 0.0;
+            if(raw > 0.002){
+                vec2 cid;
+                voronoi(tuv*uRes/uCellPx, edge, cid);
+                cr = hash1(cid+3.17);
+                fn = hash2(cid+11.3)*2.0-1.0;
+                float front = uReveal*1.25 - (tx*0.55 + cr*0.45);
+                vis = smoothstep(0.0,0.05,front);
+                birth = vis*exp(-max(front,0.0)*18.0);
+            }
+            float mask = raw*vis;
+
+            vec2 e = 1.5/uRes;
+            float hx = texture(uBevel,tuv+vec2(e.x,0.0)).r - texture(uBevel,tuv-vec2(e.x,0.0)).r;
+            float hy = texture(uBevel,tuv+vec2(0.0,e.y)).r - texture(uBevel,tuv-vec2(0.0,e.y)).r;
+            vec3 n = normalize(vec3(-hx*uBevelK, -hy*uBevelK, 1.0));
+            n = normalize(n + vec3(fn*0.17,0.0));
+
+            // fondo
+            vec3 bg = mix(vec3(0.016,0.018,0.03), vec3(0.04,0.045,0.075), uv.y);
+            float vig = smoothstep(1.25,0.3,length((uv-0.5)*vec2(aspect,1.0)));
+            bg *= 0.5+0.5*vig;
+
+            vec3 dye = tm(texture(uDye,uv).rgb);
+            float shadow = texture(uGlow, tuv + vec2(-0.005,0.012)).r * smoothstep(0.0,0.7,uReveal);
+            float halo = texture(uGlow, tuv).r * smoothstep(0.0,0.7,uReveal);
+            vec3 outside = bg + dye*0.8;
+            outside *= 1.0 - shadow*0.6;
+            outside += halo*(1.0-halo)*4.0*0.12*(dye+0.12);
+
+            // cristal: refracción con aberración cromática
+            vec2 refr = -n.xy*0.075;
+            vec3 rc;
+            rc.r = texture(uDye, uv+refr*0.85).r;
+            rc.g = texture(uDye, uv+refr*1.00).g;
+            rc.b = texture(uDye, uv+refr*1.18).b;
+            rc = tm(rc*1.3);
+            vec3 env = mix(vec3(0.03,0.035,0.06), vec3(0.32,0.36,0.5), smoothstep(-0.6,0.8,n.y+n.x*0.3));
+            vec3 inside = rc*1.15 + env*0.55 + 0.035;
+
+            float fres = pow(1.0-clamp(n.z,0.0,1.0),1.6);
+            vec3 P = vec3((uv-0.5)*vec2(aspect,1.0),0.0);
+            vec3 Lp = vec3((uLight-0.5)*vec2(aspect,1.0),0.55);
+            vec3 Hh = normalize(normalize(Lp-P)+vec3(0.0,0.0,1.0));
+            float nh = max(dot(n,Hh),0.0);
+            float spec = pow(nh,90.0)*1.4 + pow(nh,12.0)*0.12;
+
+            float t = fract(uTime/5.5);
+            float s = tx + (tuv.y-0.5)*0.5;
+            float glint = exp(-pow((s-mix(-0.4,1.6,t))*9.0,2.0))*(0.35+0.65*cr)*0.55;
+            float facetLine = (1.0-smoothstep(0.0,0.02,edge));
+
+            inside += fres*vec3(0.55,0.75,1.0)*0.6;
+            inside += spec*vec3(1.0,0.97,0.92);
+            inside += glint*vec3(1.0,0.96,0.88);
+            inside += facetLine*0.09*(0.5+rc);
+            inside += birth*vec3(0.55,0.9,1.0)*0.9 + birth*facetLine*1.6;
+
+            vec3 col = mix(outside, inside, mask);
+            col += (hash1(uv*uRes+fract(uTime)*91.7)-0.5)*0.025;
+            o = vec4(col,1.0);
+        }`
+    };
+
+    function compile(type, src) {
+        const s = gl.createShader(type);
+        gl.shaderSource(s, src);
+        gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+        return s;
+    }
+    let vsObj;
+    function program(fs) {
+        vsObj = vsObj || compile(gl.VERTEX_SHADER, VS);
+        const p = gl.createProgram();
+        gl.attachShader(p, vsObj);
+        gl.attachShader(p, compile(gl.FRAGMENT_SHADER, HEAD + fs));
+        gl.bindAttribLocation(p, 0, 'aPos');
+        gl.linkProgram(p);
+        if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+        const u = {};
+        const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+        for (let i = 0; i < count; i++) {
+            const info = gl.getActiveUniform(p, i);
+            u[info.name] = gl.getUniformLocation(p, info.name);
+        }
+        return { p, u };
+    }
+
+    let P;
+    try {
+        P = {};
+        for (const k in FS) P[k] = program(FS[k]);
+    } catch (e) {
+        console.error(e);
+        document.body.classList.add('fallback');
+        hint.hidden = true;
+        return;
+    }
+
+    // quad de pantalla completa
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    function blit(target) {
+        if (target) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+            gl.viewport(0, 0, target.w, target.h);
+        } else {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        }
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    function createFBO(w, h, filter) {
+        gl.activeTexture(gl.TEXTURE0);
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+        const fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+        if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('FBO incompleto');
+        gl.viewport(0, 0, w, h);
+        gl.clearColor(0, 0, 0, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        return {
+            tex, fbo, w, h, texel: [1 / w, 1 / h],
+            attach(id) { gl.activeTexture(gl.TEXTURE0 + id); gl.bindTexture(gl.TEXTURE_2D, tex); return id; },
+            dispose() { gl.deleteTexture(tex); gl.deleteFramebuffer(fbo); }
+        };
+    }
+    function createDouble(w, h, filter) {
+        let a = createFBO(w, h, filter), b = createFBO(w, h, filter);
+        return {
+            w, h, texel: a.texel,
+            get read() { return a; }, get write() { return b; },
+            swap() { const t = a; a = b; b = t; },
+            dispose() { a.dispose(); b.dispose(); }
+        };
+    }
+    function getResolution(res) {
+        let aspect = gl.drawingBufferWidth / gl.drawingBufferHeight;
+        if (aspect < 1) aspect = 1 / aspect;
+        const min = Math.round(res), max = Math.round(res * aspect);
+        return gl.drawingBufferWidth > gl.drawingBufferHeight ? [max, min] : [min, max];
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // ESTADO
+    // ═══════════════════════════════════════════════════════════════════
+    let velocity, dye, pressure, divergenceF, curlF;
+    let maskTex = null, bevelF, glowF, tmpF;
+    let textInfo = { box: [0.1, 0.9], bevelK: 10, cellPx: 60 };
+    let fontFamily = '"Unbounded", "Arial Black", Impact, sans-serif';
+
+    function resizeCanvas() {
+        let dpr = Math.min(window.devicePixelRatio || 1, 1.75);
+        const cw = Math.max(1, canvas.clientWidth), ch = Math.max(1, canvas.clientHeight);
+        const maxPx = 3.2e6;
+        if (cw * ch * dpr * dpr > maxPx) dpr = Math.sqrt(maxPx / (cw * ch));
+        canvas.width = Math.round(cw * dpr);
+        canvas.height = Math.round(ch * dpr);
+    }
+
+    function initFluid() {
+        [velocity, dye, pressure, divergenceF, curlF].forEach(f => f && f.dispose());
+        const s = getResolution(CFG.SIM_RES), d = getResolution(CFG.DYE_RES);
+        velocity = createDouble(s[0], s[1], gl.LINEAR);
+        dye = createDouble(d[0], d[1], gl.LINEAR);
+        pressure = createDouble(s[0], s[1], gl.NEAREST);
+        divergenceF = createFBO(s[0], s[1], gl.NEAREST);
+        curlF = createFBO(s[0], s[1], gl.NEAREST);
+    }
+
+    function buildText() {
+        const W = canvas.width, H = canvas.height;
+        const c = document.createElement('canvas');
+        c.width = W; c.height = H;
+        const g = c.getContext('2d');
+        g.fillStyle = '#000';
+        g.fillRect(0, 0, W, H);
+        g.font = `900 100px ${fontFamily}`;
+        let m = g.measureText(TEXT);
+        const h100 = (m.actualBoundingBoxAscent + m.actualBoundingBoxDescent) || 90;
+        const size = Math.min(W * 0.84 * 100 / m.width, H * 0.40 * 100 / h100);
+        g.font = `900 ${size}px ${fontFamily}`;
+        m = g.measureText(TEXT);
+        g.textAlign = 'center';
+        g.textBaseline = 'alphabetic';
+        const y = H / 2 + (m.actualBoundingBoxAscent - m.actualBoundingBoxDescent) / 2;
+        g.fillStyle = '#fff';
+        g.fillText(TEXT, W / 2, y);
+
+        if (maskTex) gl.deleteTexture(maskTex);
+        maskTex = gl.createTexture();
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, maskTex);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+        [bevelF, glowF, tmpF].forEach(f => f && f.dispose());
+        const bw = Math.ceil(W / 2), bh = Math.ceil(H / 2);
+        bevelF = createFBO(bw, bh, gl.LINEAR);
+        glowF = createFBO(bw, bh, gl.LINEAR);
+        tmpF = createFBO(bw, bh, gl.LINEAR);
+
+        const bevelSigma = size * 0.03, glowSigma = size * 0.10;
+        blurInto(maskTex, bevelF, bevelSigma / 8, W, H);
+        blurInto(maskTex, glowF, glowSigma / 8, W, H);
+
+        textInfo = {
+            box: [(W / 2 - m.width / 2) / W, (W / 2 + m.width / 2) / W],
+            bevelK: bevelSigma,
+            cellPx: size * 0.16
+        };
+    }
+
+    function blurInto(srcTex, dst, stepPx, W, H) {
+        gl.useProgram(P.blur.p);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, srcTex);
+        gl.uniform1i(P.blur.u.uTex, 0);
+        gl.uniform2f(P.blur.u.uDir, stepPx / W, 0);
+        blit(tmpF);
+        gl.uniform1i(P.blur.u.uTex, tmpF.attach(0));
+        gl.uniform2f(P.blur.u.uDir, 0, stepPx / H);
+        blit(dst);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SIMULACIÓN
+    // ═══════════════════════════════════════════════════════════════════
+    function splat(x, y, dx, dy, color, radiusScale = 1) {
+        const aspect = canvas.width / canvas.height;
+        let r = CFG.SPLAT_RADIUS / 100 * radiusScale;
+        if (aspect > 1) r *= aspect;
+        const s = P.splat;
+        gl.useProgram(s.p);
+        gl.uniform1i(s.u.uTarget, velocity.read.attach(0));
+        gl.uniform1f(s.u.aspectRatio, aspect);
+        gl.uniform2f(s.u.point, x, y);
+        gl.uniform3f(s.u.color, dx, dy, 0);
+        gl.uniform1f(s.u.radius, r);
+        blit(velocity.write); velocity.swap();
+        gl.uniform1i(s.u.uTarget, dye.read.attach(0));
+        gl.uniform3f(s.u.color, color[0], color[1], color[2]);
+        blit(dye.write); dye.swap();
+    }
+
+    function step(dt) {
+        const tx = velocity.texel;
+        let p;
+
+        p = P.curl; gl.useProgram(p.p);
+        gl.uniform2f(p.u.texelSize, tx[0], tx[1]);
+        gl.uniform1i(p.u.uVelocity, velocity.read.attach(0));
+        blit(curlF);
+
+        p = P.vorticity; gl.useProgram(p.p);
+        gl.uniform2f(p.u.texelSize, tx[0], tx[1]);
+        gl.uniform1i(p.u.uVelocity, velocity.read.attach(0));
+        gl.uniform1i(p.u.uCurl, curlF.attach(1));
+        gl.uniform1f(p.u.curl, CFG.CURL);
+        gl.uniform1f(p.u.dt, dt);
+        blit(velocity.write); velocity.swap();
+
+        p = P.divergence; gl.useProgram(p.p);
+        gl.uniform2f(p.u.texelSize, tx[0], tx[1]);
+        gl.uniform1i(p.u.uVelocity, velocity.read.attach(0));
+        blit(divergenceF);
+
+        p = P.clear; gl.useProgram(p.p);
+        gl.uniform1i(p.u.uTexture, pressure.read.attach(0));
+        gl.uniform1f(p.u.value, CFG.PRESSURE);
+        blit(pressure.write); pressure.swap();
+
+        p = P.pressure; gl.useProgram(p.p);
+        gl.uniform2f(p.u.texelSize, tx[0], tx[1]);
+        gl.uniform1i(p.u.uDivergence, divergenceF.attach(0));
+        for (let i = 0; i < CFG.ITER; i++) {
+            gl.uniform1i(p.u.uPressure, pressure.read.attach(1));
+            blit(pressure.write); pressure.swap();
+        }
+
+        p = P.gradient; gl.useProgram(p.p);
+        gl.uniform2f(p.u.texelSize, tx[0], tx[1]);
+        gl.uniform1i(p.u.uPressure, pressure.read.attach(0));
+        gl.uniform1i(p.u.uVelocity, velocity.read.attach(1));
+        blit(velocity.write); velocity.swap();
+
+        p = P.advect; gl.useProgram(p.p);
+        gl.uniform2f(p.u.uVelTexel, tx[0], tx[1]);
+        const v = velocity.read.attach(0);
+        gl.uniform1i(p.u.uVelocity, v);
+        gl.uniform1i(p.u.uSource, v);
+        gl.uniform1f(p.u.dt, dt);
+        gl.uniform1f(p.u.dissipation, CFG.VEL_DISS);
+        blit(velocity.write); velocity.swap();
+
+        gl.uniform1i(p.u.uVelocity, velocity.read.attach(0));
+        gl.uniform1i(p.u.uSource, dye.read.attach(1));
+        gl.uniform1f(p.u.dissipation, CFG.DENSITY_DISS);
+        blit(dye.write); dye.swap();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // INTERACCIÓN, LUZ Y CRISTALIZACIÓN
+    // ═══════════════════════════════════════════════════════════════════
+    const pointer = { x: 0.5, y: 0.5, px: 0.5, py: 0.5, dx: 0, dy: 0, moved: false, down: false, lastMove: -1e9 };
+    const light = { x: 0.62, y: 0.78 };
+    const tilt = { x: 0, y: 0 };
+    let anim = { mode: reduceMotion ? 'none' : 'intro', t0: performance.now() };
+    let interacted = false;
+
+    function toUv(e) {
+        const r = canvas.getBoundingClientRect();
+        return [(e.clientX - r.left) / r.width, 1 - (e.clientY - r.top) / r.height];
+    }
+    function markInteracted() {
+        if (!interacted) { interacted = true; hint.classList.add('gone'); }
+    }
+
+    canvas.addEventListener('pointermove', e => {
+        const [x, y] = toUv(e);
+        const aspect = canvas.width / canvas.height;
+        let dx = x - pointer.x, dy = y - pointer.y;
+        if (aspect < 1) dx *= aspect;
+        if (aspect > 1) dy /= aspect;
+        if (!coarse || pointer.down) {
+            pointer.dx += dx; pointer.dy += dy;
+            pointer.moved = true;
+        }
+        pointer.x = x; pointer.y = y;
+        pointer.lastMove = performance.now();
+        if (Math.abs(dx) + Math.abs(dy) > 0.002) markInteracted();
+    });
+    canvas.addEventListener('pointerdown', e => {
+        const [x, y] = toUv(e);
+        pointer.x = x; pointer.y = y;
+        pointer.down = true;
+        pointer.lastMove = performance.now();
+        markInteracted();
+        burst(x, y);
+        if (!reduceMotion) anim = { mode: 'shatter', t0: performance.now() };
+    });
+    window.addEventListener('pointerup', () => { pointer.down = false; });
+    window.addEventListener('pointercancel', () => { pointer.down = false; });
+
+    function burst(x, y) {
+        const t = performance.now() / 1000;
+        for (let i = 0; i < 7; i++) {
+            const a = i / 7 * Math.PI * 2 + t;
+            const c = paletteAt(t * 0.4 + i * 0.6);
+            splat(x, y, Math.cos(a) * 900, Math.sin(a) * 900, [c[0] * 0.9, c[1] * 0.9, c[2] * 0.9], 1.6);
+        }
+    }
+
+    function introSplats() {
+        const r = mulberry32(1987);
+        for (let i = 0; i < 9; i++) {
+            const x = 0.15 + r() * 0.7, y = 0.3 + r() * 0.4;
+            const a = r() * Math.PI * 2, s = 300 + r() * 600;
+            const c = paletteAt(i * 0.55);
+            splat(x, y, Math.cos(a) * s, Math.sin(a) * s, [c[0] * 1.1, c[1] * 1.1, c[2] * 1.1], 2.2);
+        }
+    }
+
+    const easeOut = t => 1 - Math.pow(1 - t, 3);
+    const easeIn = t => t * t * t;
+    function revealAt(now) {
+        if (anim.mode === 'none') return 1;
+        const e = now - anim.t0;
+        if (anim.mode === 'intro') return easeOut(Math.min(1, e / 2000));
+        if (e < 280) return 1 - easeIn(e / 280);
+        return easeOut(Math.min(1, (e - 280) / 1500));
+    }
+
+    const emitters = [{ px: 0, py: 0 }, { px: 0, py: 0 }];
+    function emitAmbient(t, dt) {
+        const speed = reduceMotion ? 0.35 : 1;
+        emitters.forEach((em, k) => {
+            const ph = k * 2.1, tt = t * speed;
+            const x = 0.5 + 0.36 * Math.sin(tt * 0.23 + ph) + 0.08 * Math.sin(tt * 0.71 + ph * 3);
+            const y = 0.5 + 0.22 * Math.sin(tt * 0.37 + ph * 1.7);
+            if (em.px !== 0) {
+                const c = paletteAt(tt * 0.12 + k * 2);
+                splat(x, y, (x - em.px) * 9000, (y - em.py) * 9000, [c[0] * 0.035, c[1] * 0.035, c[2] * 0.035], 1.3);
+            }
+            em.px = x; em.py = y;
+        });
+    }
+
+    function updateLight(t, dt) {
+        const idle = performance.now() - pointer.lastMove > 3500;
+        const tx = idle ? 0.5 + 0.32 * Math.sin(t * 0.4) : pointer.x;
+        const ty = idle ? 0.62 + 0.22 * Math.cos(t * 0.31) : pointer.y;
+        const k = 1 - Math.exp(-dt * (idle ? 1.5 : 7));
+        light.x += (tx - light.x) * k;
+        light.y += (ty - light.y) * k;
+        tilt.x += ((light.x - 0.5) * 2 - tilt.x) * k;
+        tilt.y += ((light.y - 0.5) * 2 - tilt.y) * k;
+    }
+
+    function render(t, now) {
+        const d = P.display;
+        gl.useProgram(d.p);
+        gl.uniform1i(d.u.uDye, dye.read.attach(0));
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, maskTex);
+        gl.uniform1i(d.u.uMask, 1);
+        gl.uniform1i(d.u.uBevel, bevelF.attach(2));
+        gl.uniform1i(d.u.uGlow, glowF.attach(3));
+        gl.uniform2f(d.u.uRes, canvas.width, canvas.height);
+        gl.uniform1f(d.u.uTime, t);
+        gl.uniform1f(d.u.uReveal, revealAt(now));
+        gl.uniform2f(d.u.uLight, light.x, light.y);
+        gl.uniform2f(d.u.uTilt, tilt.x, tilt.y);
+        gl.uniform1f(d.u.uBevelK, textInfo.bevelK);
+        gl.uniform1f(d.u.uCellPx, textInfo.cellPx);
+        gl.uniform2f(d.u.uBox, textInfo.box[0], textInfo.box[1]);
+        blit(null);
+    }
+
+    let last = performance.now();
+    function frame(now) {
+        const t = now / 1000;
+        const dt = Math.min((now - last) / 1000, 0.033);
+        last = now;
+        gl.disable(gl.BLEND);
+        updateLight(t, dt);
+        emitAmbient(t, dt);
+        if (pointer.moved) {
+            const c = paletteAt(t * 0.35);
+            splat(pointer.x, pointer.y, pointer.dx * CFG.SPLAT_FORCE, pointer.dy * CFG.SPLAT_FORCE, [c[0] * 0.17, c[1] * 0.17, c[2] * 0.17]);
+            pointer.moved = false;
+            pointer.dx = pointer.dy = 0;
+        }
+        step(dt);
+        render(t, now);
+        requestAnimationFrame(frame);
+    }
+
+    function rebuild() {
+        resizeCanvas();
+        initFluid();
+        buildText();
+        introSplats();
+    }
+
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+            try { rebuild(); } catch (e) { console.error(e); }
+        }, 150);
+    });
+
+    // espera a la fuente (máx. 2,5 s) antes de rasterizar las letras
+    const fontWait = (document.fonts && document.fonts.load)
+        ? Promise.race([document.fonts.load('900 200px "Unbounded"', TEXT), new Promise(r => setTimeout(r, 2500))])
+        : Promise.resolve();
+    fontWait.catch(() => {}).then(() => {
+        try {
+            rebuild();
+        } catch (e) {
+            console.error(e);
+            document.body.classList.add('fallback');
+            hint.hidden = true;
+            return;
+        }
+        anim.t0 = performance.now();
+        last = performance.now();
+        requestAnimationFrame(frame);
+    });
+})();
+</script>
